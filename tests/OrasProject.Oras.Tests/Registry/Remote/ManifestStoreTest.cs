@@ -1006,4 +1006,109 @@ public class ManifestStoreTest
         Assert.True(firstUpdatedIndexDeleted);
         Assert.Equal(secondUpdatedIndexReferrersBytes, receivedIndexContent);
     }
+
+    /// <summary>
+    /// Tests that TagAsync succeeds when the first PUT request receives a 401 Unauthorized
+    /// response and authentication retry is triggered. This validates the fix for the issue
+    /// where non-seekable streams from FetchAsync would fail when the request needed to be
+    /// retried after obtaining authentication tokens.
+    /// </summary>
+    [Fact]
+    public async Task ManifestStore_TagAsync_WithAuthRetry_ShouldSucceed()
+    {
+        var index = """{"manifests":[]}"""u8.ToArray();
+        var indexDesc = new Descriptor
+        {
+            MediaType = MediaType.ImageIndex,
+            Digest = ComputeSha256(index),
+            Size = index.Length
+        };
+        var reference = "test-tag";
+        var gotIndex = Array.Empty<byte>();
+        var putRequestCount = 0;
+
+        async Task<HttpResponseMessage> MockHandler(HttpRequestMessage req, CancellationToken cancellationToken)
+        {
+            var res = new HttpResponseMessage
+            {
+                RequestMessage = req
+            };
+
+            // GET request for fetching the manifest
+            if (req.Method == HttpMethod.Get && req.RequestUri?.AbsolutePath == $"/v2/test/manifests/{indexDesc.Digest}")
+            {
+                if (req.Headers.TryGetValues("Accept", out IEnumerable<string>? values) && !values.Contains(indexDesc.MediaType))
+                {
+                    return new HttpResponseMessage(HttpStatusCode.BadRequest);
+                }
+                res.Content = new ByteArrayContent(index);
+                res.Headers.Add(_dockerContentDigestHeader, indexDesc.Digest);
+                res.Content.Headers.Add("Content-Type", indexDesc.MediaType);
+                return res;
+            }
+
+            // PUT request for pushing the manifest with reference
+            if (req.Method == HttpMethod.Put && req.RequestUri?.AbsolutePath == $"/v2/test/manifests/{reference}")
+            {
+                putRequestCount++;
+
+                // First PUT attempt returns 401 to simulate expired/missing auth token
+                if (putRequestCount == 1)
+                {
+                    res.StatusCode = HttpStatusCode.Unauthorized;
+                    res.Headers.WwwAuthenticate.ParseAdd("Basic realm=\"test\"");
+                    return res;
+                }
+
+                // Second attempt (after auth) should succeed
+                if (req.Content?.Headers?.ContentLength != null)
+                {
+                    var buf = new byte[req.Content.Headers.ContentLength.Value];
+                    (await req.Content.ReadAsByteArrayAsync(cancellationToken)).CopyTo(buf, 0);
+                    gotIndex = buf;
+                }
+
+                res.Headers.Add(_dockerContentDigestHeader, indexDesc.Digest);
+                res.StatusCode = HttpStatusCode.Created;
+                return res;
+            }
+
+            res.StatusCode = HttpStatusCode.NotFound;
+            return res;
+        }
+
+        var repo = new Repository(new RepositoryOptions()
+        {
+            Reference = Reference.Parse("localhost:5000/test"),
+            Client = new OrasProject.Oras.Registry.Remote.Auth.Client(
+                new HttpClient(CustomHandler(MockHandler).Object),
+                new TestCredentialProvider()),
+            PlainHttp = true,
+        });
+        var cancellationToken = new CancellationToken();
+        var store = new ManifestStore(repo);
+
+        // This should succeed despite the 401 retry, verifying the stream is properly buffered
+        await store.TagAsync(indexDesc, reference, cancellationToken);
+
+        Assert.Equal(index, gotIndex);
+        Assert.Equal(2, putRequestCount); // Verify that retry happened
+    }
+
+    /// <summary>
+    /// Simple credential provider for testing that returns basic auth credentials.
+    /// </summary>
+    private class TestCredentialProvider : OrasProject.Oras.Registry.Remote.Auth.ICredentialProvider
+    {
+        public Task<OrasProject.Oras.Registry.Remote.Auth.Credential> ResolveCredentialAsync(
+            string registry,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(new OrasProject.Oras.Registry.Remote.Auth.Credential
+            {
+                Username = "testuser",
+                Password = "testpassword"
+            });
+        }
+    }
 }
