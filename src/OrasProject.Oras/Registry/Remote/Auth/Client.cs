@@ -15,6 +15,7 @@ using Microsoft.Extensions.Caching.Memory;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -187,7 +188,7 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
         originalRequest.AddDefaultUserAgent();
         if (originalRequest.Headers.Authorization != null || BaseClient.DefaultRequestHeaders.Authorization != null)
         {
-            return await SendRequestAsync(originalRequest, cancellationToken).ConfigureAwait(false);
+            return await SendRequestWithConnectionRetryAsync(originalRequest, originalRequest, cancellationToken).ConfigureAwait(false);
         }
         var host = originalRequest.RequestUri?.Authority ??
                     throw new ArgumentException("originalRequest.RequestUri or originalRequest.RequestUri.Authority property is null.", nameof(originalRequest));
@@ -222,7 +223,7 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
             }
         }
 
-        var response1 = await SendRequestAsync(requestAttempt1, cancellationToken).ConfigureAwait(false);
+        var response1 = await SendRequestWithConnectionRetryAsync(requestAttempt1, originalRequest, cancellationToken).ConfigureAwait(false);
         if (response1.StatusCode != HttpStatusCode.Unauthorized)
         {
             return response1;
@@ -240,10 +241,11 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
                     var basicAuthToken = await FetchBasicAuthAsync(host, cancellationToken).ConfigureAwait(false);
                     Cache.SetCache(host, schemeFromChallenge, string.Empty, basicAuthToken);
 
-                    // Attempt again with basic token
-                    var requestAttempt2 = await originalRequest.CloneAsync(rewindContent: true, cancellationToken).ConfigureAwait(false);
-                    requestAttempt2.Headers.Authorization = new AuthenticationHeaderValue("Basic", basicAuthToken);
-                    return await SendRequestAsync(requestAttempt2, cancellationToken).ConfigureAwait(false);
+                    // Attempt again with basic token, using retry logic for connection errors
+                    return await SendRetryRequestAsync(
+                        originalRequest,
+                        new AuthenticationHeaderValue("Basic", basicAuthToken),
+                        cancellationToken).ConfigureAwait(false);
                 }
             case Challenge.Scheme.Bearer:
                 {
@@ -271,9 +273,10 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
                     if (newKey != attemptedKey &&
                         Cache.TryGetToken(host, schemeFromChallenge, newKey, out var cachedToken))
                     {
-                        var requestAttempt2 = await originalRequest.CloneAsync(rewindContent: true, cancellationToken).ConfigureAwait(false);
-                        requestAttempt2.Headers.Authorization = new AuthenticationHeaderValue("Bearer", cachedToken);
-                        var response2 = await SendRequestAsync(requestAttempt2, cancellationToken).ConfigureAwait(false);
+                        var response2 = await SendRetryRequestAsync(
+                            originalRequest,
+                            new AuthenticationHeaderValue("Bearer", cachedToken),
+                            cancellationToken).ConfigureAwait(false);
 
                         if (response2.StatusCode != HttpStatusCode.Unauthorized)
                         {
@@ -303,9 +306,10 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
                     ).ConfigureAwait(false);
                     Cache.SetCache(host, schemeFromChallenge, newKey, bearerAuthToken);
 
-                    var requestAttempt3 = await originalRequest.CloneAsync(rewindContent: true, cancellationToken).ConfigureAwait(false);
-                    requestAttempt3.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerAuthToken);
-                    return await SendRequestAsync(requestAttempt3, cancellationToken).ConfigureAwait(false);
+                    return await SendRetryRequestAsync(
+                        originalRequest,
+                        new AuthenticationHeaderValue("Bearer", bearerAuthToken),
+                        cancellationToken).ConfigureAwait(false);
                 }
             default:
                 return response1;
@@ -549,4 +553,106 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
         HttpRequestMessage request,
         CancellationToken cancellationToken = default)
         => await BaseClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+
+    /// <summary>
+    /// Sends an HTTP request with retry logic for connection errors.
+    /// If the first attempt fails with a connection error (e.g., server closed the connection),
+    /// the request is cloned from the original and retried once.
+    /// <para>
+    /// Note: This method performs at most one retry on connection errors. If persistent connection issues
+    /// occur, the exception from the retry attempt will propagate to the caller.
+    /// </para>
+    /// </summary>
+    /// <param name="request">The prepared request to send (may have auth headers added).</param>
+    /// <param name="originalRequest">The original request to clone from for retry.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>The HTTP response message.</returns>
+    private async Task<HttpResponseMessage> SendRequestWithConnectionRetryAsync(
+        HttpRequestMessage request,
+        HttpRequestMessage originalRequest,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await SendRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex) when (IsConnectionClosedError(ex))
+        {
+            // The connection was closed by the server. This can happen when:
+            // - The server closes idle connections
+            // - The server has connection pooling issues
+            // - Network conditions cause connection drops
+            // Clone the request and retry - HttpClient will use a fresh connection.
+            var authHeader = request.Headers.Authorization;
+            var retryRequest = await originalRequest.CloneAsync(rewindContent: true, cancellationToken).ConfigureAwait(false);
+            if (authHeader != null)
+            {
+                retryRequest.Headers.Authorization = authHeader;
+            }
+            return await SendRequestAsync(retryRequest, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Sends an HTTP request with retry logic for connection errors that can occur after a 401 challenge.
+    /// When the server closes the connection after a 401 response (e.g., without reading the full request body),
+    /// the subsequent authenticated retry may fail with a connection error. This method catches such errors
+    /// and retries once with a fresh connection.
+    /// <para>
+    /// Note: This method performs at most one retry on connection errors. If persistent connection issues
+    /// occur, the exception from the retry attempt will propagate to the caller.
+    /// </para>
+    /// </summary>
+    /// <param name="originalRequest">The original request to clone and send.</param>
+    /// <param name="authHeader">The authorization header value to add to the request.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>The HTTP response message.</returns>
+    private async Task<HttpResponseMessage> SendRetryRequestAsync(
+        HttpRequestMessage originalRequest,
+        AuthenticationHeaderValue authHeader,
+        CancellationToken cancellationToken = default)
+    {
+        var request = await originalRequest.CloneAsync(rewindContent: true, cancellationToken).ConfigureAwait(false);
+        request.Headers.Authorization = authHeader;
+
+        try
+        {
+            return await SendRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex) when (IsConnectionClosedError(ex))
+        {
+            // The connection was closed by the server after the 401 response.
+            // This can happen when the server doesn't fully read the request body before responding.
+            // Clone the request again and retry - HttpClient will use a fresh connection.
+            // Note: We don't dispose 'request' here because its content stream may be shared with
+            // originalRequest.Content, and disposing would close the underlying stream.
+            var retryRequest = await originalRequest.CloneAsync(rewindContent: true, cancellationToken).ConfigureAwait(false);
+            retryRequest.Headers.Authorization = authHeader;
+            return await SendRequestAsync(retryRequest, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Determines if an HttpRequestException indicates a connection was forcibly closed.
+    /// This can happen when the server closes the TCP connection (e.g., after a 401 response)
+    /// and the client tries to reuse the connection.
+    /// </summary>
+    /// <param name="ex">The exception to check.</param>
+    /// <returns>True if the exception indicates a closed connection; otherwise, false.</returns>
+    private static bool IsConnectionClosedError(HttpRequestException ex)
+    {
+        // Check for IOException indicating connection was closed
+        if (ex.InnerException is IOException ioEx &&
+            ioEx.InnerException is System.Net.Sockets.SocketException socketEx)
+        {
+            // Handle socket error codes that indicate connection closure:
+            // - ConnectionReset (10054): An existing connection was forcibly closed by the remote host
+            // - ConnectionAborted (10053): Software caused connection abort
+            // - Shutdown (10058): Cannot send after socket shutdown
+            return socketEx.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionReset ||
+                   socketEx.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionAborted ||
+                   socketEx.SocketErrorCode == System.Net.Sockets.SocketError.Shutdown;
+        }
+        return false;
+    }
 }

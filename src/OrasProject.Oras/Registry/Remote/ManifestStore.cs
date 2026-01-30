@@ -367,7 +367,11 @@ public class ManifestStore(Repository repository) : IManifestStore
     public async Task TagAsync(Descriptor descriptor, string reference, CancellationToken cancellationToken = default)
     {
         var remoteReference = Repository.ParseReference(reference);
-        using var contentStream = await FetchAsync(descriptor, cancellationToken).ConfigureAwait(false);
+        // Buffer the content into a seekable MemoryStream to support authentication retries.
+        // Network streams from FetchAsync are non-seekable and cannot be rewound if a 401
+        // response triggers token refresh and request retry.
+        var contentBytes = await this.FetchAllAsync(descriptor, cancellationToken).ConfigureAwait(false);
+        using var contentStream = new MemoryStream(contentBytes);
         await DoPushAsync(descriptor, contentStream, remoteReference, cancellationToken).ConfigureAwait(false);
     }
 
