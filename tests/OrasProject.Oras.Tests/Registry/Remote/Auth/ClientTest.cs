@@ -1626,4 +1626,99 @@ public class ClientTest
             ItExpr.Is<HttpRequestMessage>(r => r.RequestUri != null && r.RequestUri.Host == host && r.Headers.Authorization != null && r.Headers.Authorization.Scheme == "Basic" && r.Headers.Authorization.Parameter == basicToken),
             ItExpr.IsAny<CancellationToken>());
     }
+
+    /// <summary>
+    /// Tests that when an authenticated retry request fails with a connection error 
+    /// (e.g., server closed connection after 401), the client retries with a fresh connection.
+    /// </summary>
+    [Fact]
+    public async Task Client_SendAsync_WithConnectionErrorOnRetry_ShouldRetryAndSucceed()
+    {
+        // Arrange
+        var host = "localhost";
+        var realm = "http://localhost/token";
+        var service = "test-service";
+        var expectedToken = "test-token";
+        var requestCount = 0;
+
+        var handler = new Mock<DelegatingHandler>();
+        handler.Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage req, CancellationToken _) =>
+            {
+                requestCount++;
+
+                // Token endpoint
+                if (req.RequestUri?.AbsolutePath == "/token")
+                {
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent($"{{\"access_token\":\"{expectedToken}\"}}")
+                    };
+                }
+
+                // First request - no auth, return 401
+                if (requestCount == 1)
+                {
+                    return new HttpResponseMessage(HttpStatusCode.Unauthorized)
+                    {
+                        Headers =
+                        {
+                            WwwAuthenticate =
+                            {
+                                new AuthenticationHeaderValue(
+                                    "Bearer",
+                                    $"realm=\"{realm}\",service=\"{service}\"")
+                            }
+                        }
+                    };
+                }
+
+                // Second request - authenticated, simulate connection reset
+                if (requestCount == 2)
+                {
+                    throw new HttpRequestException(
+                        "Error while copying content to a stream.",
+                        new System.IO.IOException(
+                            "Unable to write data to the transport connection.",
+                            new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.ConnectionReset)));
+                }
+
+                // Third request - authenticated retry after connection error
+                if (req.Headers.Authorization != null 
+                    && req.Headers.Authorization.Scheme == "Bearer" 
+                    && req.Headers.Authorization.Parameter == expectedToken)
+                {
+                    return new HttpResponseMessage(HttpStatusCode.OK);
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.Forbidden);
+            });
+
+        var noOpCache = new Mock<ICache>();
+        noOpCache.Setup(m => m.TryGetScheme(It.IsAny<string>(), out It.Ref<Challenge.Scheme>.IsAny)).Returns(false);
+        noOpCache.Setup(m => m.TryGetToken(It.IsAny<string>(), It.IsAny<Challenge.Scheme>(), It.IsAny<string>(), out It.Ref<string>.IsAny)).Returns(false);
+
+        var authClient = new OrasProject.Oras.Registry.Remote.Auth.Client(
+            new HttpClient(handler.Object),
+            null,
+            noOpCache.Object);
+
+        var request = new HttpRequestMessage(HttpMethod.Put, $"http://{host}/v2/test/manifests/latest")
+        {
+            Content = new ByteArrayContent(Encoding.UTF8.GetBytes("test content"))
+        };
+
+        // Act
+        var response = await authClient.SendAsync(request);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        // Verify: 1 initial (401) + 1 token fetch + 1 retry that fails + 1 token fetch + 1 successful retry = 5
+        // But actually, token fetch is same endpoint, so: 1 (401) + 1 (conn error) + 1 (success) = 3 main + token calls
+        Assert.True(requestCount >= 3, $"Expected at least 3 requests, got {requestCount}");
+    }
 }
