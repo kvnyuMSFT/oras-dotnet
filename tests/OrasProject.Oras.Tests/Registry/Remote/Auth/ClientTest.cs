@@ -1639,7 +1639,7 @@ public class ClientTest
         var realm = "http://localhost/token";
         var service = "test-service";
         var expectedToken = "test-token";
-        var requestCount = 0;
+        var mainEndpointRequestCount = 0;
 
         var handler = new Mock<DelegatingHandler>();
         handler.Protected()
@@ -1649,9 +1649,7 @@ public class ClientTest
                 ItExpr.IsAny<CancellationToken>())
             .ReturnsAsync((HttpRequestMessage req, CancellationToken _) =>
             {
-                requestCount++;
-
-                // Token endpoint
+                // Token endpoint - always return token, don't count
                 if (req.RequestUri?.AbsolutePath == "/token")
                 {
                     return new HttpResponseMessage(HttpStatusCode.OK)
@@ -1660,8 +1658,11 @@ public class ClientTest
                     };
                 }
 
-                // First request - no auth, return 401
-                if (requestCount == 1)
+                // Only count main endpoint requests (not token endpoint)
+                mainEndpointRequestCount++;
+
+                // First main request - no auth, return 401
+                if (mainEndpointRequestCount == 1)
                 {
                     return new HttpResponseMessage(HttpStatusCode.Unauthorized)
                     {
@@ -1677,8 +1678,8 @@ public class ClientTest
                     };
                 }
 
-                // Second request - authenticated, simulate connection reset
-                if (requestCount == 2)
+                // Second main request - authenticated, simulate connection reset
+                if (mainEndpointRequestCount == 2)
                 {
                     throw new HttpRequestException(
                         "Error while copying content to a stream.",
@@ -1687,7 +1688,7 @@ public class ClientTest
                             new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.ConnectionReset)));
                 }
 
-                // Third request - authenticated retry after connection error
+                // Third main request - authenticated retry after connection error
                 if (req.Headers.Authorization != null 
                     && req.Headers.Authorization.Scheme == "Bearer" 
                     && req.Headers.Authorization.Parameter == expectedToken)
@@ -1713,12 +1714,15 @@ public class ClientTest
         };
 
         // Act
-        var response = await authClient.SendAsync(request);
+        using var response = await authClient.SendAsync(request);
 
         // Assert
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        // Verify: 1 initial (401) + 1 token fetch + 1 retry that fails + 1 token fetch + 1 successful retry = 5
-        // But actually, token fetch is same endpoint, so: 1 (401) + 1 (conn error) + 1 (success) = 3 main + token calls
-        Assert.True(requestCount >= 3, $"Expected at least 3 requests, got {requestCount}");
+        // Expected flow:
+        // 1. First main request (no auth) -> 401
+        // 2. Token fetch -> token
+        // 3. Second main request (with auth) -> connection error
+        // 4. Third main request (retry with auth) -> success
+        Assert.Equal(3, mainEndpointRequestCount);
     }
 }

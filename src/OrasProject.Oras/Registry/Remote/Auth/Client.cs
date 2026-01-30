@@ -559,6 +559,10 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
     /// When the server closes the connection after a 401 response (e.g., without reading the full request body),
     /// the subsequent authenticated retry may fail with a connection error. This method catches such errors
     /// and retries once with a fresh connection.
+    /// <para>
+    /// Note: This method performs at most one retry on connection errors. If persistent connection issues
+    /// occur, the exception from the retry attempt will propagate to the caller.
+    /// </para>
     /// </summary>
     /// <param name="originalRequest">The original request to clone and send.</param>
     /// <param name="authHeader">The authorization header value to add to the request.</param>
@@ -581,6 +585,8 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
             // The connection was closed by the server after the 401 response.
             // This can happen when the server doesn't fully read the request body before responding.
             // Clone the request again and retry - HttpClient will use a fresh connection.
+            // Note: We don't dispose 'request' here because its content stream may be shared with
+            // originalRequest.Content, and disposing would close the underlying stream.
             var retryRequest = await originalRequest.CloneAsync(rewindContent: true, cancellationToken).ConfigureAwait(false);
             retryRequest.Headers.Authorization = authHeader;
             return await SendRequestAsync(retryRequest, cancellationToken).ConfigureAwait(false);
@@ -597,16 +603,16 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
     private static bool IsConnectionClosedError(HttpRequestException ex)
     {
         // Check for IOException indicating connection was closed
-        if (ex.InnerException is IOException ioEx)
+        if (ex.InnerException is IOException ioEx &&
+            ioEx.InnerException is System.Net.Sockets.SocketException socketEx)
         {
-            // Check for socket exception with "connection forcibly closed" or similar
-            if (ioEx.InnerException is System.Net.Sockets.SocketException socketEx)
-            {
-                // SocketError.ConnectionReset (10054) - An existing connection was forcibly closed by the remote host
-                return socketEx.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionReset;
-            }
-            // Also check the message for connection-related errors
-            return ioEx.Message.Contains("connection", StringComparison.OrdinalIgnoreCase);
+            // Handle socket error codes that indicate connection closure:
+            // - ConnectionReset (10054): An existing connection was forcibly closed by the remote host
+            // - ConnectionAborted (10053): Software caused connection abort
+            // - Shutdown (10058): Cannot send after socket shutdown
+            return socketEx.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionReset ||
+                   socketEx.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionAborted ||
+                   socketEx.SocketErrorCode == System.Net.Sockets.SocketError.Shutdown;
         }
         return false;
     }
