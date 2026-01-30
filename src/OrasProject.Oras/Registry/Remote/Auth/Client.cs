@@ -188,7 +188,7 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
         originalRequest.AddDefaultUserAgent();
         if (originalRequest.Headers.Authorization != null || BaseClient.DefaultRequestHeaders.Authorization != null)
         {
-            return await SendRequestAsync(originalRequest, cancellationToken).ConfigureAwait(false);
+            return await SendRequestWithConnectionRetryAsync(originalRequest, originalRequest, cancellationToken).ConfigureAwait(false);
         }
         var host = originalRequest.RequestUri?.Authority ??
                     throw new ArgumentException("originalRequest.RequestUri or originalRequest.RequestUri.Authority property is null.", nameof(originalRequest));
@@ -223,7 +223,7 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
             }
         }
 
-        var response1 = await SendRequestAsync(requestAttempt1, cancellationToken).ConfigureAwait(false);
+        var response1 = await SendRequestWithConnectionRetryAsync(requestAttempt1, originalRequest, cancellationToken).ConfigureAwait(false);
         if (response1.StatusCode != HttpStatusCode.Unauthorized)
         {
             return response1;
@@ -553,6 +553,45 @@ public class Client(HttpClient? httpClient = null, ICredentialProvider? credenti
         HttpRequestMessage request,
         CancellationToken cancellationToken = default)
         => await BaseClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+
+    /// <summary>
+    /// Sends an HTTP request with retry logic for connection errors.
+    /// If the first attempt fails with a connection error (e.g., server closed the connection),
+    /// the request is cloned from the original and retried once.
+    /// <para>
+    /// Note: This method performs at most one retry on connection errors. If persistent connection issues
+    /// occur, the exception from the retry attempt will propagate to the caller.
+    /// </para>
+    /// </summary>
+    /// <param name="request">The prepared request to send (may have auth headers added).</param>
+    /// <param name="originalRequest">The original request to clone from for retry.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>The HTTP response message.</returns>
+    private async Task<HttpResponseMessage> SendRequestWithConnectionRetryAsync(
+        HttpRequestMessage request,
+        HttpRequestMessage originalRequest,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await SendRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex) when (IsConnectionClosedError(ex))
+        {
+            // The connection was closed by the server. This can happen when:
+            // - The server closes idle connections
+            // - The server has connection pooling issues
+            // - Network conditions cause connection drops
+            // Clone the request and retry - HttpClient will use a fresh connection.
+            var authHeader = request.Headers.Authorization;
+            var retryRequest = await originalRequest.CloneAsync(rewindContent: true, cancellationToken).ConfigureAwait(false);
+            if (authHeader != null)
+            {
+                retryRequest.Headers.Authorization = authHeader;
+            }
+            return await SendRequestAsync(retryRequest, cancellationToken).ConfigureAwait(false);
+        }
+    }
 
     /// <summary>
     /// Sends an HTTP request with retry logic for connection errors that can occur after a 401 challenge.

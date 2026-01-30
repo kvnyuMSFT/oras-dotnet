@@ -1725,4 +1725,75 @@ public class ClientTest
         // 4. Third main request (retry with auth) -> success
         Assert.Equal(3, mainEndpointRequestCount);
     }
+
+    /// <summary>
+    /// Tests that when an authenticated request using a cached token fails with a connection error,
+    /// the client retries with a fresh connection.
+    /// </summary>
+    [Fact]
+    public async Task Client_SendAsync_WithCachedTokenAndConnectionError_ShouldRetryAndSucceed()
+    {
+        // Arrange
+        var host = "localhost";
+        var expectedToken = "cached-test-token";
+        var mainEndpointRequestCount = 0;
+
+        var handler = new Mock<DelegatingHandler>();
+        handler.Protected()
+            .Setup<Task<HttpResponseMessage>>(
+                "SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage req, CancellationToken _) =>
+            {
+                // Only count main endpoint requests
+                mainEndpointRequestCount++;
+
+                // First request with cached token - simulate connection reset
+                if (mainEndpointRequestCount == 1)
+                {
+                    throw new HttpRequestException(
+                        "Error while copying content to a stream.",
+                        new System.IO.IOException(
+                            "Unable to write data to the transport connection.",
+                            new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.ConnectionReset)));
+                }
+
+                // Second request (retry) - should succeed with auth
+                if (req.Headers.Authorization != null 
+                    && req.Headers.Authorization.Scheme == "Bearer" 
+                    && req.Headers.Authorization.Parameter == expectedToken)
+                {
+                    return new HttpResponseMessage(HttpStatusCode.OK);
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.Forbidden);
+            });
+
+        // Set up cache to return the cached token
+        var cacheMock = new Mock<ICache>();
+        var scheme = Challenge.Scheme.Bearer;
+        cacheMock.Setup(m => m.TryGetScheme(It.IsAny<string>(), out scheme)).Returns(true);
+        cacheMock.Setup(m => m.TryGetToken(It.IsAny<string>(), Challenge.Scheme.Bearer, It.IsAny<string>(), out expectedToken)).Returns(true);
+
+        var authClient = new OrasProject.Oras.Registry.Remote.Auth.Client(
+            new HttpClient(handler.Object),
+            null,
+            cacheMock.Object);
+
+        var request = new HttpRequestMessage(HttpMethod.Put, $"http://{host}/v2/test/blobs/uploads/test")
+        {
+            Content = new ByteArrayContent(Encoding.UTF8.GetBytes("test blob content"))
+        };
+
+        // Act
+        using var response = await authClient.SendAsync(request);
+
+        // Assert
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        // Expected flow:
+        // 1. First request (with cached token) -> connection error
+        // 2. Retry request (with cached token) -> success
+        Assert.Equal(2, mainEndpointRequestCount);
+    }
 }
